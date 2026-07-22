@@ -371,7 +371,6 @@ async function saveRoom(code, obj){
 let myRole = null;
 let roomCode = null;
 let myPlayerId = null;
-let renderedLogCount = 0;
 let pollTimer = null;
 let engineTimer = null;
 
@@ -408,7 +407,7 @@ ${stageLines}
 ВСЕГДА отвечай ТОЛЬКО валидным JSON без markdown-разметки, без \`\`\`, без пояснений вне JSON:
 {
   "narration": "художественное описание на русском, 2-5 предложений",
-  "scene_svg": "богатый SVG в стиле гравюры на дереве: viewBox='0 0 400 250', слои (задний/средний/передний план), штриховка для теней, только path/line/circle/ellipse/polyline/rect со stroke='currentColor' fill='none' stroke-width 1-3, без градиентов/текста/заливок, минимум 15-25 элементов",
+  "scene_svg": "ПРОСТОЙ узнаваемый SVG-рисунок сцены в стиле гравюры: viewBox='0 0 400 250'. Рисуй буквально то, что описано в narration, используя эти готовые рецепты форм (комбинируй нужные): ДОМ/ХИЖИНА — прямоугольник (стены) + треугольник сверху (крыша), можно с маленьким прямоугольником-дверью снизу; ДЕРЕВО — вертикальная линия (ствол) + круг или пара кругов сверху (крона); ГОРЫ/ХОЛМЫ на фоне — несколько треугольников разной высоты вдоль верхней трети; ВОДА/РЕКА — 2-3 горизонтальные волнистые линии (path с плавными изгибами); ПЕРСОНАЖ/СУЩЕСТВО — круг (голова) на прямоугольнике или треугольнике (тело), простые линии-конечности; МОСТ — горизонтальный прямоугольник на 2-3 вертикальных опорах; ДВЕРЬ/ВХОД В ПОДЗЕМЕЛЬЕ — арка (полукруг path) с тёмным проёмом внутри; ФАКЕЛ/ОГОНЬ — вертикальная линия с волнистым овалом-пламенем сверху; НАДГРОБИЕ/КАМЕНЬ — скруглённый прямоугольник или полукруг. Собери сцену из 6-14 таких простых фигур на переднем/среднем/заднем плане (не больше — важна узнаваемость, а не количество деталей), можно добавить немного коротких штрихов-теней. Только path/line/circle/ellipse/polyline/rect со stroke='currentColor' fill='none' stroke-width 1.5-3, без градиентов/текста/заливок",
   "hp_change": 0,
   "roll_request": null,
   "options": ["вариант действия 1", "вариант действия 2", "вариант действия 3"],
@@ -677,7 +676,6 @@ function enterGameScreen(){
     el('nudge-btn').addEventListener('click', nudgeStory);
     el('clear-roll-btn').addEventListener('click', clearStuckRoll);
   }
-  renderedLogCount = 0;
   el('narration').innerHTML = '';
   refreshGameFromRoom(true);
   pollTimer = setInterval(()=> refreshGameFromRoom(false), 3000);
@@ -753,13 +751,7 @@ async function refreshGameFromRoom(initial){
   }
 
   const log = room.log || [];
-  if(renderedLogCount === 0){
-    el('narration').innerHTML = '';
-  }
-  for(let i = renderedLogCount; i < log.length; i++){
-    appendLogEntry(log[i]);
-  }
-  renderedLogCount = log.length;
+  renderLog(log);
 
   const lastNarration = [...log].reverse().find(e=>e.kind==='narration');
   if(lastNarration && lastNarration.svg){ renderScene(lastNarration.svg); }
@@ -801,24 +793,61 @@ async function refreshGameFromRoom(initial){
   }
 }
 
-function appendLogEntry(entry){
-  const narrEl = el('narration');
+function renderLog(log){
+  const container = el('narration');
+  container.innerHTML = '';
+  if(!log.length) return;
+
+  let lastNarrIdx = -1;
+  for(let i = log.length - 1; i >= 0; i--){
+    if(log[i].kind === 'narration'){ lastNarrIdx = i; break; }
+  }
+  if(lastNarrIdx === -1) lastNarrIdx = 0;
+
+  const older = log.slice(0, lastNarrIdx);
+  const current = log.slice(lastNarrIdx);
+
+  if(older.length){
+    const details = document.createElement('details');
+    details.style.marginBottom = '14px';
+    const summary = document.createElement('summary');
+    const pastTurns = older.filter(e=>e.kind==='narration').length;
+    summary.textContent = `Предыдущие события (${pastTurns})`;
+    summary.style.cursor = 'pointer';
+    summary.style.color = 'var(--brass-light)';
+    summary.style.fontFamily = "'Cinzel', serif";
+    summary.style.fontSize = '13px';
+    details.appendChild(summary);
+    const histWrap = document.createElement('div');
+    histWrap.style.opacity = '0.7';
+    histWrap.style.marginTop = '10px';
+    older.forEach(e => appendEntryTo(histWrap, e));
+    details.appendChild(histWrap);
+    container.appendChild(details);
+  }
+
+  const curWrap = document.createElement('div');
+  current.forEach(e => appendEntryTo(curWrap, e));
+  container.appendChild(curWrap);
+  container.scrollTop = container.scrollHeight;
+}
+
+function appendEntryTo(wrap, entry){
   if(entry.kind === 'narration'){
     const p = document.createElement('p'); p.className='gm-p'; p.textContent = entry.text || '';
-    narrEl.appendChild(p);
+    wrap.appendChild(p);
   } else if(entry.kind === 'action'){
     const p = document.createElement('p'); p.className='log-entry-player'; p.textContent = `» ${entry.player}: ${entry.text}`;
-    narrEl.appendChild(p);
+    wrap.appendChild(p);
   } else if(entry.kind === 'roll'){
     const p = document.createElement('p'); p.className='log-entry-roll';
     p.textContent = `🎲 ${entry.player} — ${entry.reason}: ${entry.roll}${entry.mod!==0?(entry.mod>0?'+':'')+entry.mod:''} = ${entry.total} против ${entry.dc} — ${entry.success ? 'успех' : 'провал'}`;
-    narrEl.appendChild(p);
+    wrap.appendChild(p);
   } else if(entry.kind === 'nudge'){
     const p = document.createElement('p'); p.className='log-entry-roll';
     p.textContent = `↷ ${entry.player} направляет сюжет: ${entry.text}`;
-    narrEl.appendChild(p);
+    wrap.appendChild(p);
   }
-  narrEl.scrollTop = narrEl.scrollHeight;
 }
 
 async function nudgeStory(){
