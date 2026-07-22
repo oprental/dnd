@@ -524,7 +524,7 @@ el('start-game-btn').addEventListener('click', async ()=>{
     if(!parsed) throw new Error('Не удалось разобрать ответ Мастера.');
     room.apiHistory = [{role:'user', content: openingMsg}, {role:'assistant', content: resp}];
     room.log = [{ kind:'narration', text: parsed.narration, svg: parsed.scene_svg, options: parsed.options||[] }];
-    room.pendingRoll = parsed.roll_request ? { ...parsed.roll_request, forPlayerId: null } : null;
+    room.pendingRoll = null; // opening scene has no specific actor — never lock the input on a roll nobody can resolve
     room.started = true;
     applyStatsToAllIfNeeded(room, parsed, null);
     advanceStageIfComplete(room, parsed);
@@ -669,11 +669,13 @@ function enterGameScreen(){
   if(myRole === 'gm'){
     el('gm-party-toggle-wrap').innerHTML = `
       <button class="btn-ghost btn" id="toggle-party-btn" style="font-size:12.5px; padding:7px 14px;">Показать анкеты партии</button>
-      <button class="btn-ghost btn" id="nudge-btn" style="font-size:12.5px; padding:7px 14px;">Подтолкнуть сюжет →</button>`;
+      <button class="btn-ghost btn" id="nudge-btn" style="font-size:12.5px; padding:7px 14px;">Подтолкнуть сюжет →</button>
+      <button class="btn-ghost btn" id="clear-roll-btn" style="font-size:12.5px; padding:7px 14px;">Снять зависшую проверку</button>`;
     el('toggle-party-btn').addEventListener('click', ()=>{
       el('gm-party-panel').classList.toggle('hidden');
     });
     el('nudge-btn').addEventListener('click', nudgeStory);
+    el('clear-roll-btn').addEventListener('click', clearStuckRoll);
   }
   renderedLogCount = 0;
   el('narration').innerHTML = '';
@@ -830,6 +832,15 @@ async function nudgeStory(){
   refreshGameFromRoom(false);
 }
 
+async function clearStuckRoll(){
+  const room = await loadRoom(roomCode);
+  if(!room) return;
+  room.pendingRoll = null;
+  room.processing = false;
+  await saveRoom(roomCode, room);
+  refreshGameFromRoom(false);
+}
+
 function renderScene(svg){
   const wrap = el('art-wrap');
   const safe = (svg && svg.trim().startsWith('<svg')) ? svg : fallbackSVG();
@@ -903,7 +914,7 @@ async function runEngineTick(){
     room2.log.push({ kind:'narration', text: parsed.narration, svg: parsed.scene_svg, options: parsed.options || [] });
     applyStatsToAllIfNeeded(room2, parsed, last.actorId);
     advanceStageIfComplete(room2, parsed);
-    room2.pendingRoll = parsed.roll_request ? { ...parsed.roll_request, forPlayerId: last.actorId } : null;
+    room2.pendingRoll = (parsed.roll_request && last.actorId) ? { ...parsed.roll_request, forPlayerId: last.actorId } : null;
     room2.processing = false;
     await saveRoom(roomCode, room2);
   }catch(e){
