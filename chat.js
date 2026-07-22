@@ -1,15 +1,15 @@
-// Proxies GM requests to xAI's Grok API. The API key lives only on the
-// server (Vercel environment variable GROK_API_KEY) and is never sent to
-// the browser.
+// Proxies GM requests to Groq's free API (OpenAI-compatible). The API key
+// lives only on the server (Vercel environment variable GROQ_API_KEY) and
+// is never sent to the browser.
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
 
-  const apiKey = process.env.GROK_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    res.status(500).json({ error: 'GROK_API_KEY is not set on the server.' });
+    res.status(500).json({ error: 'GROQ_API_KEY is not set on the server.' });
     return;
   }
 
@@ -20,27 +20,27 @@ export default async function handler(req, res) {
       return;
     }
 
-    const xaiMessages = [
+    const groqMessages = [
       { role: 'system', content: system || '' },
       ...messages.map(m => ({ role: m.role, content: m.content }))
     ];
 
-    const response = await fetch('https://api.x.ai/v1/chat/completions', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: 'grok-4.3',
-        messages: xaiMessages,
+        model: 'llama-3.3-70b-versatile',
+        messages: groqMessages,
         max_tokens: 1200
       })
     });
 
     if (!response.ok) {
       const errText = await response.text();
-      res.status(response.status).json({ error: `Grok API error: ${errText}` });
+      res.status(response.status).json({ error: `Groq API error: ${errText}` });
       return;
     }
 
