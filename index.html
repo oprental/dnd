@@ -407,6 +407,976 @@ ${stageLines}
 ВСЕГДА отвечай ТОЛЬКО валидным JSON без markdown-разметки, без \`\`\`, без пояснений вне JSON:
 {
   "narration": "художественное описание на русском, 2-5 предложений",
+  "scene_prompt": "краткое (15-30 слов) описание текущей сцены НА АНГЛИЙСКОМ языке для генерации изображения нейросетью: кто/что в кадре, обстановка, освещение и настроение, конкретные детали из narration. Только суть сцены, без слов о художественном стиле — стиль добавляется отдельно",
+  "hp_change": 0,
+  "roll_request": null,
+  "options": ["вариант действия 1", "вариант действия 2", "вариант действия 3"],
+  "inventory_add": [],
+  "stage_complete": false
+}
+roll_request если нужен: {"reason": "причина", "skill": "Ловкость", "dc": 14}. Иначе null.`;
+}
+
+function renderStageTracker(containerId, room){
+  const wrap = el(containerId);
+  wrap.innerHTML = '';
+  (room.stages || []).forEach((s,i)=>{
+    const li = document.createElement('li');
+    li.className = s.done ? 'done' : (i === room.currentStageIndex ? 'current' : '');
+    li.innerHTML = `${s.title}<span class="stage-desc">${s.description}</span>`;
+    wrap.appendChild(li);
+  });
+}
+
+/* ---------- Landing ---------- */
+el('role-gm-btn').addEventListener('click', ()=>{
+  myRole = 'gm'; hide('landing'); show('gm-create');
+});
+el('role-player-btn').addEventListener('click', ()=>{
+  myRole = 'player'; hide('landing'); show('player-join');
+});
+
+/* ---------- GM: create room ---------- */
+el('create-room-btn').addEventListener('click', async ()=>{
+  const scenario = el('scenario').value.trim();
+  const gmName = el('gm-name').value.trim() || 'Мастер';
+  el('create-error').classList.add('hidden');
+  if(!scenario){
+    el('create-error').textContent = 'Опиши сценарий кампании.';
+    el('create-error').classList.remove('hidden');
+    return;
+  }
+  const btn = el('create-room-btn'); btn.disabled = true; btn.textContent = 'Мастер разбирает сценарий…';
+  roomCode = makeRoomCode();
+  let stages;
+  try{
+    stages = await extractStages(scenario);
+  }catch(e){
+    stages = [{ title:'Начало приключения', description:'Партия вступает в историю.', done:false }];
+  }
+  const room = {
+    scenario, gmName, started:false, processing:false,
+    players:{}, log:[], pendingRoll:null, apiHistory:[],
+    stages, currentStageIndex:0
+  };
+  const ok = await saveRoom(roomCode, room);
+  btn.disabled = false; btn.textContent = 'Создать комнату';
+  if(!ok){
+    el('create-error').textContent = 'Не удалось создать комнату. Попробуй ещё раз.';
+    el('create-error').classList.remove('hidden');
+    return;
+  }
+  hide('gm-create'); show('gm-lobby');
+  el('room-code-display').textContent = roomCode;
+  renderStageTracker('lobby-stages', room);
+  startLobbyPolling();
+});
+
+el('copy-code-btn').addEventListener('click', ()=>{
+  navigator.clipboard.writeText(roomCode).catch(()=>{});
+  const btn = el('copy-code-btn');
+  const old = btn.textContent; btn.textContent = 'Скопировано';
+  setTimeout(()=>{ btn.textContent = old; }, 1500);
+});
+
+function renderLobbyPlayers(room){
+  const wrap = el('lobby-players');
+  wrap.innerHTML = '';
+  const ids = Object.keys(room.players || {});
+  el('lobby-empty').classList.toggle('hidden', ids.length > 0);
+  el('start-game-btn').disabled = ids.length === 0;
+  ids.forEach(id=>{
+    const p = room.players[id];
+    const d = document.createElement('details');
+    d.className = 'player-card';
+    d.innerHTML = `<summary>${p.name} <span class="pc-meta">— ${p.klass}</span></summary>
+      <div class="pc-body">
+        <div><span class="pc-label">Предыстория</span>${p.backstory || '—'}</div>
+        <div><span class="pc-label">Черта</span>${p.trait || '—'}</div>
+        <div><span class="pc-label">Цель</span>${p.goal || '—'}</div>
+        <div><span class="pc-label">Тайна</span>${p.secret || '—'}</div>
+      </div>`;
+    wrap.appendChild(d);
+  });
+}
+
+function startLobbyPolling(){
+  pollTimer = setInterval(async ()=>{
+    const room = await loadRoom(roomCode);
+    if(!room) return;
+    renderLobbyPlayers(room);
+  }, 2500);
+}
+
+el('start-game-btn').addEventListener('click', async ()=>{
+  clearInterval(pollTimer);
+  const room = await loadRoom(roomCode);
+  if(!room) return;
+  const btn = el('start-game-btn'); btn.disabled = true; btn.textContent = 'Мастер готовится…';
+  const partyLore = Object.values(room.players).map(p=>
+    `— ${p.name} (${p.klass}): предыстория — ${p.backstory || 'не указана'}; черта характера — ${p.trait || 'не указана'}; цель — ${p.goal || 'не указана'}; тайна — ${p.secret || 'нет'}.`
+  ).join('\n');
+  const openingMsg = `Сценарий кампании: ${room.scenario}\n\nПартия героев:\n${partyLore}\n\nНачни историю: опиши вводную сцену, в которую вовлечена вся партия, и первую ситуацию, требующую решения.`;
+  try{
+    const resp = await callGMRaw([{ role:'user', content: openingMsg }], buildSystemPrompt(room));
+    const parsed = extractJSON(resp);
+    if(!parsed) throw new Error('Не удалось разобрать ответ Мастера.');
+    room.apiHistory = [{role:'user', content: openingMsg}, {role:'assistant', content: resp}];
+    room.log = [{ kind:'narration', text: parsed.narration, prompt: parsed.scene_prompt, seed: Math.floor(Math.random()*1000000), options: parsed.options||[] }];
+    room.pendingRoll = null; // opening scene has no specific actor — never lock the input on a roll nobody can resolve
+    room.started = true;
+    applyStatsToAllIfNeeded(room, parsed, null);
+    advanceStageIfComplete(room, parsed);
+    await saveRoom(roomCode, room);
+    hide('gm-lobby');
+    enterGameScreen();
+  }catch(e){
+    btn.disabled = false; btn.textContent = 'Начать игру';
+    alert('Не удалось начать игру: ' + e.message);
+    startLobbyPolling();
+  }
+});
+
+/* ---------- Player: join room ---------- */
+el('join-room-btn').addEventListener('click', async ()=>{
+  const code = el('join-code').value.trim().toUpperCase();
+  el('join-error').classList.add('hidden');
+  if(!code){ return; }
+  const room = await loadRoom(code);
+  if(!room){
+    el('join-error').textContent = 'Комната с таким кодом не найдена.';
+    el('join-error').classList.remove('hidden');
+    return;
+  }
+  if(room.started){
+    el('join-error').textContent = 'Игра в этой комнате уже началась.';
+    el('join-error').classList.remove('hidden');
+    return;
+  }
+  roomCode = code;
+  hide('player-join'); show('player-form');
+});
+
+el('submit-form-btn').addEventListener('click', async ()=>{
+  const name = el('p-name').value.trim();
+  const klass = el('p-class').value;
+  const backstory = el('p-backstory').value.trim();
+  const trait = el('p-trait').value.trim();
+  const goal = el('p-goal').value.trim();
+  const secret = el('p-secret').value.trim();
+  el('form-error').classList.add('hidden');
+  if(!name){
+    el('form-error').textContent = 'Дай герою имя.';
+    el('form-error').classList.remove('hidden');
+    return;
+  }
+  const btn = el('submit-form-btn'); btn.disabled = true; btn.textContent = 'Отправляем...';
+  const room = await loadRoom(roomCode);
+  if(!room){
+    btn.disabled = false; btn.textContent = 'Отправить анкету';
+    el('form-error').textContent = 'Комната пропала. Попробуй войти заново.';
+    el('form-error').classList.remove('hidden');
+    return;
+  }
+  myPlayerId = makeId();
+  room.players[myPlayerId] = { id: myPlayerId, name, klass, backstory, trait, goal, secret, hp:20, maxHp:20, inventory:[] };
+  await saveRoom(roomCode, room);
+  hide('player-form'); show('player-wait');
+  el('wait-recap').innerHTML = `<div class="player-card" style="background:transparent;"><div class="pc-body">
+    <div><span class="pc-label">Имя</span>${name}</div>
+    <div><span class="pc-label">Класс</span>${klass}</div>
+    <div><span class="pc-label">Предыстория</span>${backstory || '—'}</div>
+    <div><span class="pc-label">Черта</span>${trait || '—'}</div>
+    <div><span class="pc-label">Цель</span>${goal || '—'}</div>
+  </div></div>`;
+  btn.disabled = false; btn.textContent = 'Отправить анкету';
+  waitForStart();
+});
+
+function waitForStart(){
+  pollTimer = setInterval(async ()=>{
+    const room = await loadRoom(roomCode);
+    if(room && room.started){
+      clearInterval(pollTimer);
+      hide('player-wait');
+      enterGameScreen();
+    }
+  }, 2500);
+}
+
+/* ---------- Shared API call helper (raw text back) ---------- */
+async function callGMRaw(messages, systemPrompt){
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system: systemPrompt, messages })
+  });
+  if(!response.ok){ throw new Error('Мастер не отвечает (ошибка сети или API-ключа).'); }
+  const data = await response.json();
+  return data.text || '';
+}
+
+function extractJSONArray(text){
+  let t = text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+  try{ const r = JSON.parse(t); if(Array.isArray(r)) return r; }catch(e){}
+  const first = t.indexOf('['); const last = t.lastIndexOf(']');
+  if(first !== -1 && last !== -1 && last > first){
+    try{ const r = JSON.parse(t.slice(first, last+1)); if(Array.isArray(r)) return r; }catch(e){}
+  }
+  return null;
+}
+
+async function extractStages(scenarioText){
+  const raw = await callGMRaw([{ role:'user', content: scenarioText }], STAGE_EXTRACT_SYSTEM);
+  const parsed = extractJSONArray(raw);
+  if(Array.isArray(parsed) && parsed.length){
+    return parsed.map(s=>({ title: s.title || 'Этап', description: s.description || '', done:false }));
+  }
+  return [{ title:'Начало приключения', description:'Партия вступает в историю.', done:false }];
+}
+
+function advanceStageIfComplete(room, parsed){
+  if(!parsed.stage_complete) return;
+  const stages = room.stages || [];
+  const i = room.currentStageIndex;
+  if(stages[i]){
+    stages[i].done = true;
+    if(i + 1 < stages.length){ room.currentStageIndex = i + 1; }
+  }
+}
+
+function applyStatsToAllIfNeeded(room, parsed, actingPlayerId){
+  if(actingPlayerId && room.players[actingPlayerId]){
+    const p = room.players[actingPlayerId];
+    if(typeof parsed.hp_change === 'number' && parsed.hp_change !== 0){
+      p.hp = Math.max(0, Math.min(p.maxHp, p.hp + parsed.hp_change));
+    }
+    if(Array.isArray(parsed.inventory_add)){
+      parsed.inventory_add.forEach(it=>{ if(it && !p.inventory.includes(it)) p.inventory.push(it); });
+    }
+  }
+}
+
+/* ---------- Game screen (shared by GM and players) ---------- */
+const IMAGE_STYLE_SUFFIX = ', dark fantasy ink engraving illustration, monochrome linework, medieval manuscript woodcut style, dramatic shadows, highly detailed';
+
+function sceneImageUrl(prompt, seed){
+  const base = (prompt && prompt.trim()) ? prompt.trim() : 'a mysterious torchlit dungeon corridor';
+  const full = base + IMAGE_STYLE_SUFFIX;
+  const params = new URLSearchParams({ width:'400', height:'250', nologo:'true', seed:String(seed || 1) });
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(full)}?${params.toString()}`;
+}
+
+function renderScene(prompt, seed){
+  const wrap = el('art-wrap');
+  const url = sceneImageUrl(prompt, seed);
+  wrap.innerHTML = '';
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = 'Иллюстрация сцены';
+  img.style.width = '100%';
+  img.style.height = '100%';
+  img.style.objectFit = 'cover';
+  img.style.display = 'block';
+  img.onerror = ()=>{ img.src = sceneImageUrl('a mysterious torchlit dungeon corridor', seed); };
+  wrap.appendChild(img);
+}
+
+function enterGameScreen(){
+  hide('landing'); hide('gm-create'); hide('gm-lobby'); hide('player-join'); hide('player-form'); hide('player-wait');
+  show('game');
+  if(myRole === 'gm'){
+    el('gm-party-toggle-wrap').innerHTML = `
+      <button class="btn-ghost btn" id="toggle-party-btn" style="font-size:12.5px; padding:7px 14px;">Показать анкеты партии</button>
+      <button class="btn-ghost btn" id="nudge-btn" style="font-size:12.5px; padding:7px 14px;">Подтолкнуть сюжет →</button>
+      <button class="btn-ghost btn" id="clear-roll-btn" style="font-size:12.5px; padding:7px 14px;">Снять зависшую проверку</button>`;
+    el('toggle-party-btn').addEventListener('click', ()=>{
+      el('gm-party-panel').classList.toggle('hidden');
+    });
+    el('nudge-btn').addEventListener('click', nudgeStory);
+    el('clear-roll-btn').addEventListener('click', clearStuckRoll);
+  }
+  el('narration').innerHTML = '';
+  refreshGameFromRoom(true);
+  pollTimer = setInterval(()=> refreshGameFromRoom(false), 3000);
+  if(myRole === 'gm'){
+    engineTimer = setInterval(runEngineTick, 3000);
+  }
+}
+
+async function refreshGameFromRoom(initial){
+  const room = await loadRoom(roomCode);
+  if(!room) return;
+
+  renderStageTracker('game-stages', room);
+
+  if(myRole === 'gm'){
+    const wrap = document.createElement('div');
+    Object.values(room.players).forEach(p=>{
+      const d = document.createElement('details');
+      d.className = 'player-card';
+      d.innerHTML = `<summary>${p.name} <span class="pc-meta">— ${p.klass} · HP ${p.hp}/${p.maxHp}</span></summary>
+        <div class="pc-body">
+          <div><span class="pc-label">Предыстория</span>${p.backstory || '—'}</div>
+          <div><span class="pc-label">Черта</span>${p.trait || '—'}</div>
+          <div><span class="pc-label">Цель</span>${p.goal || '—'}</div>
+          <div><span class="pc-label">Тайна</span>${p.secret || '—'}</div>
+        </div>`;
+      wrap.appendChild(d);
+    });
+    el('gm-party-panel').innerHTML = '<h3 style="margin-bottom:10px;">Анкеты партии (видит только Мастер)</h3>';
+    el('gm-party-panel').appendChild(wrap);
+  }
+
+  const me = myRole === 'player' ? room.players[myPlayerId] : null;
+  if(me){
+    el('sheet-name').textContent = me.name;
+    el('sheet-class').textContent = me.klass;
+    el('hp-text').textContent = `${me.hp} / ${me.maxHp}`;
+    el('hp-fill').style.width = Math.max(0, Math.min(100, (me.hp/me.maxHp)*100)) + '%';
+    el('mini-hp').textContent = `${me.name} · HP ${me.hp}/${me.maxHp}`;
+    const modList = el('mod-list'); modList.innerHTML = '';
+    const table = CLASS_MODIFIERS[me.klass] || {};
+    SKILLS.forEach(skill=>{
+      const v = table[skill] !== undefined ? table[skill] : 0;
+      const li = document.createElement('li');
+      li.innerHTML = `<span>${skill}</span><span>${v>=0?'+':''}${v}</span>`;
+      modList.appendChild(li);
+    });
+    const inv = el('inv-list'); inv.innerHTML = '';
+    if(me.inventory.length === 0){
+      const li = document.createElement('li'); li.textContent = 'Пусто'; li.style.opacity='0.6'; inv.appendChild(li);
+    } else {
+      me.inventory.forEach(item=>{ const li=document.createElement('li'); li.textContent=item; inv.appendChild(li); });
+    }
+  } else if(myRole === 'gm'){
+    el('sheet-name').textContent = room.gmName;
+    el('sheet-class').textContent = 'Мастер';
+    el('hp-text').textContent = '—';
+    el('hp-fill').style.width = '0%';
+    el('mini-hp').textContent = `${room.gmName} · ведёт партию`;
+    el('mod-list').innerHTML = '';
+    el('inv-list').innerHTML = '<li style="opacity:0.6;">—</li>';
+  }
+
+  const roster = el('roster-list'); roster.innerHTML = '';
+  Object.values(room.players).forEach(p=>{
+    if(myRole==='player' && p.id === myPlayerId) return;
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="r-name">${p.name}</span> — ${p.klass} · HP ${p.hp}/${p.maxHp}`;
+    roster.appendChild(li);
+  });
+  if(roster.children.length === 0){
+    roster.innerHTML = '<li style="opacity:0.6;">Больше никого нет</li>';
+  }
+
+  const log = room.log || [];
+  renderLog(log);
+
+  const lastNarration = [...log].reverse().find(e=>e.kind==='narration');
+  if(lastNarration){ renderScene(lastNarration.prompt, lastNarration.seed); }
+
+  const optionsRow = el('options-row'); optionsRow.innerHTML = '';
+  const rollArea = el('roll-area'); rollArea.innerHTML = '';
+
+  const busy = !!room.processing;
+  setLoading(busy);
+
+  if(room.pendingRoll){
+    const pr = room.pendingRoll;
+    const isMine = myRole === 'player' && pr.forPlayerId === myPlayerId;
+    const forName = pr.forPlayerId && room.players[pr.forPlayerId] ? room.players[pr.forPlayerId].name : 'герой';
+    const mod = isMine ? getModifier(me.klass, pr.skill) : 0;
+    const modText = mod >= 0 ? `+${mod}` : `${mod}`;
+    const box = document.createElement('div');
+    box.className = 'roll-box';
+    box.innerHTML = `<span class="reason">${pr.reason}${pr.skill ? ' ('+pr.skill+(isMine?' '+modText:'')+')':''} — сложность ${pr.dc} — ждём ${forName}</span>`;
+    if(isMine){
+      const btn = document.createElement('button');
+      btn.className = 'btn-seal'; btn.textContent = 'Бросить к20';
+      btn.onclick = ()=> doRoll(pr);
+      box.appendChild(btn);
+    }
+    rollArea.appendChild(box);
+    el('action-input').disabled = true; el('send-btn').disabled = true;
+  } else if(!busy) {
+    el('action-input').disabled = false; el('send-btn').disabled = false;
+    if(lastNarration && Array.isArray(lastNarration.options)){
+      lastNarration.options.forEach(opt=>{
+        const b = document.createElement('button'); b.className='btn-seal'; b.textContent=opt;
+        b.onclick = ()=> sendAction(opt);
+        optionsRow.appendChild(b);
+      });
+    }
+  } else {
+    el('action-input').disabled = true; el('send-btn').disabled = true;
+  }
+}
+
+function renderLog(log){
+  const container = el('narration');
+  container.innerHTML = '';
+  if(!log.length) return;
+
+  let lastNarrIdx = -1;
+  for(let i = log.length - 1; i >= 0; i--){
+    if(log[i].kind === 'narration'){ lastNarrIdx = i; break; }
+  }
+  if(lastNarrIdx === -1) lastNarrIdx = 0;
+
+  const older = log.slice(0, lastNarrIdx);
+  const current = log.slice(lastNarrIdx);
+
+  if(older.length){
+    const details = document.createElement('details');
+    details.style.marginBottom = '14px';
+    const summary = document.createElement('summary');
+    const pastTurns = older.filter(e=>e.kind==='narration').length;
+    summary.textContent = `Предыдущие события (${pastTurns})`;
+    summary.style.cursor = 'pointer';
+    summary.style.color = 'var(--brass-light)';
+    summary.style.fontFamily = "'Cinzel', serif";
+    summary.style.fontSize = '13px';
+    details.appendChild(summary);
+    const histWrap = document.createElement('div');
+    histWrap.style.opacity = '0.7';
+    histWrap.style.marginTop = '10px';
+    older.forEach(e => appendEntryTo(histWrap, e));
+    details.appendChild(histWrap);
+    container.appendChild(details);
+  }
+
+  const curWrap = document.createElement('div');
+  current.forEach(e => appendEntryTo(curWrap, e));
+  container.appendChild(curWrap);
+  container.scrollTop = container.scrollHeight;
+}
+
+function appendEntryTo(wrap, entry){
+  if(entry.kind === 'narration'){
+    const p = document.createElement('p'); p.className='gm-p'; p.textContent = entry.text || '';
+    wrap.appendChild(p);
+  } else if(entry.kind === 'action'){
+    const p = document.createElement('p'); p.className='log-entry-player'; p.textContent = `» ${entry.player}: ${entry.text}`;
+    wrap.appendChild(p);
+  } else if(entry.kind === 'roll'){
+    const p = document.createElement('p'); p.className='log-entry-roll';
+    p.textContent = `🎲 ${entry.player} — ${entry.reason}: ${entry.roll}${entry.mod!==0?(entry.mod>0?'+':'')+entry.mod:''} = ${entry.total} против ${entry.dc} — ${entry.success ? 'успех' : 'провал'}`;
+    wrap.appendChild(p);
+  } else if(entry.kind === 'nudge'){
+    const p = document.createElement('p'); p.className='log-entry-roll';
+    p.textContent = `↷ ${entry.player} направляет сюжет: ${entry.text}`;
+    wrap.appendChild(p);
+  }
+}
+
+async function nudgeStory(){
+  const room = await loadRoom(roomCode);
+  if(!room || room.processing || room.pendingRoll) return;
+  const stages = room.stages || [];
+  const next = stages[room.currentStageIndex];
+  if(!next){ alert('Все этапы сюжета уже пройдены.'); return; }
+  room.log.push({ kind:'nudge', player: room.gmName, text: `к этапу «${next.title}»` });
+  await saveRoom(roomCode, room);
+  refreshGameFromRoom(false);
+}
+
+async function clearStuckRoll(){
+  const room = await loadRoom(roomCode);
+  if(!room) return;
+  room.pendingRoll = null;
+  room.processing = false;
+  await saveRoom(roomCode, room);
+  refreshGameFromRoom(false);
+}
+
+function setLoading(on){
+  el('loading').classList.toggle('hidden', !on);
+}
+
+async function sendAction(text){
+  if(!text || !text.trim()) return;
+  const room = await loadRoom(roomCode);
+  if(!room || room.processing || room.pendingRoll) return;
+  const actorName = myRole === 'gm' ? room.gmName : (room.players[myPlayerId] ? room.players[myPlayerId].name : 'Игрок');
+  const actorId = myRole === 'player' ? myPlayerId : null;
+  room.log.push({ kind:'action', player: actorName, text: text.trim(), actorId });
+  el('action-input').value = '';
+  await saveRoom(roomCode, room);
+  refreshGameFromRoom(false);
+}
+
+async function doRoll(pr){
+  const room = await loadRoom(roomCode);
+  if(!room) return;
+  const me = room.players[myPlayerId];
+  const roll = Math.floor(Math.random()*20) + 1;
+  const mod = getModifier(me.klass, pr.skill);
+  const total = roll + mod;
+  const success = total >= pr.dc;
+  room.log.push({ kind:'roll', player: me.name, reason: pr.reason, skill: pr.skill, dc: pr.dc, roll, mod, total, success, actorId: myPlayerId });
+  room.pendingRoll = null;
+  await saveRoom(roomCode, room);
+  refreshGameFromRoom(false);
+}
+
+el('send-btn').addEventListener('click', ()=> sendAction(el('action-input').value));
+el('action-input').addEventListener('keydown', (e)=>{ if(e.key === 'Enter') sendAction(el('action-input').value); });
+
+/* ---------- GM engine loop: watches shared log and calls the AI ---------- */
+async function runEngineTick(){
+  const room = await loadRoom(roomCode);
+  if(!room || room.processing || room.pendingRoll) return;
+  const log = room.log || [];
+  const last = log[log.length - 1];
+  if(!last || last.kind === 'narration') return;
+
+  room.processing = true;
+  await saveRoom(roomCode, room);
+
+  let userMsg;
+  if(last.kind === 'action'){
+    userMsg = `${last.player}: ${last.text}`;
+  } else if(last.kind === 'nudge'){
+    const stages = room.stages || [];
+    const target = stages[room.currentStageIndex];
+    userMsg = `[Мастер направляет ход событий: подведи историю к следующему сюжетному этапу — "${target ? target.title + ': ' + target.description : 'дальнейшие события'}". Сделай переход правдоподобным в рамках уже происходящего, в этом же ходу.]`;
+  } else {
+    userMsg = `[Бросок: ${last.player} — ${last.reason}, к20 выпало ${last.roll}${last.mod!==0?(last.mod>0?'+':'')+last.mod:''}, итог ${last.total} против сложности ${last.dc} — ${last.success ? 'УСПЕХ' : 'ПРОВАЛ'}. Опиши, что происходит дальше, строго следуя этому исходу.]`;
+  }
+
+  try{
+    const fresh = await loadRoom(roomCode);
+    const history = (fresh.apiHistory || []).concat([{ role:'user', content: userMsg }]);
+    const raw = await callGMRaw(history.slice(-16), buildSystemPrompt(fresh));
+    const parsed = extractJSON(raw);
+    if(!parsed) throw new Error('bad json');
+
+    const room2 = await loadRoom(roomCode);
+    room2.apiHistory = history.concat([{ role:'assistant', content: raw }]).slice(-16);
+    room2.log.push({ kind:'narration', text: parsed.narration, prompt: parsed.scene_prompt, seed: Math.floor(Math.random()*1000000), options: parsed.options || [] });
+    applyStatsToAllIfNeeded(room2, parsed, last.actorId);
+    advanceStageIfComplete(room2, parsed);
+    room2.pendingRoll = (parsed.roll_request && last.actorId) ? { ...parsed.roll_request, forPlayerId: last.actorId } : null;
+    room2.processing = false;
+    await saveRoom(roomCode, room2);
+  }catch(e){
+    const room3 = await loadRoom(roomCode);
+    room3.processing = false;
+    await saveRoom(roomCode, room3);
+  }
+}
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Хроники подземелья — ИИ Мастер</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Cinzel:wght@500;600&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+*{box-sizing:border-box;}
+
+:root{
+  --ink:#241a12;
+  --parchment-2:#ddd0a5;
+  --parchment-3:#f3ead0;
+  --blood:#7a2020;
+  --blood-bright:#9c2b2b;
+  --brass:#a9832c;
+  --brass-light:#c9a44f;
+  --shadow:0 6px 18px rgba(20,12,4,0.35);
+}
+
+body{
+  margin:0; min-height:100vh;
+  background:
+    radial-gradient(ellipse at 20% 0%, #2e2013 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 100%, #241a10 0%, transparent 55%),
+    linear-gradient(160deg,#1a130c 0%, #120d08 100%);
+  font-family:'EB Garamond', serif; color:var(--parchment-3);
+  padding:28px 16px 60px; display:flex; justify-content:center;
+}
+.wrap{ width:100%; max-width:900px; }
+h1,h2,h3{ font-family:'Cinzel Decorative', serif; margin:0; }
+
+.masthead{ text-align:center; margin-bottom:22px; }
+.masthead h1{ font-size:clamp(24px,4vw,38px); color:var(--brass-light); letter-spacing:1px; text-shadow:0 2px 0 rgba(0,0,0,0.5); }
+.masthead .rule{ height:2px; margin:10px auto 0; width:min(520px,80%); background:linear-gradient(90deg,transparent,var(--brass),transparent); }
+.masthead .sub{ font-style:italic; color:var(--parchment-2); font-size:14px; margin-top:8px; opacity:0.8; }
+
+.panel{
+  background:linear-gradient(180deg, rgba(40,30,20,0.55), rgba(25,18,12,0.65));
+  border:1px solid rgba(169,131,44,0.35); border-radius:6px;
+  padding:22px; box-shadow:var(--shadow); margin-bottom:18px;
+}
+
+label{ display:block; font-size:14px; letter-spacing:0.5px; color:var(--brass-light); margin:14px 0 6px; font-family:'Cinzel', serif; font-weight:500; }
+label:first-child{ margin-top:0; }
+
+textarea, input[type=text], select{
+  width:100%; background:var(--parchment-3); color:var(--ink); border:1px solid var(--brass);
+  border-radius:3px; padding:10px 12px; font-family:'EB Garamond', serif; font-size:16px; resize:vertical;
+}
+textarea:focus, input[type=text]:focus, select:focus{ outline:2px solid var(--brass-light); }
+
+.row2{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media (max-width:600px){ .row2{ grid-template-columns:1fr; } }
+
+.btn{
+  font-family:'Cinzel', serif; font-weight:600; letter-spacing:0.5px;
+  background:linear-gradient(180deg,var(--blood-bright),var(--blood)); color:#f3e6d8;
+  border:1px solid #4a1010; border-radius:4px; padding:11px 20px; cursor:pointer; font-size:14px;
+  box-shadow:0 3px 0 #2f0c0c, 0 4px 8px rgba(0,0,0,0.4); transition:transform .08s ease;
+}
+.btn:hover{ filter:brightness(1.08); }
+.btn:active{ transform:translateY(2px); box-shadow:0 1px 0 #2f0c0c; }
+.btn:disabled{ opacity:0.5; cursor:default; }
+.btn-ghost{ background:transparent; border:1px solid var(--brass); color:var(--brass-light); box-shadow:none; }
+.btn-ghost:active{ transform:none; }
+.btn-seal{
+  font-family:'EB Garamond', serif; font-style:italic;
+  background:radial-gradient(circle at 35% 30%, var(--brass-light), var(--brass) 70%);
+  color:#2a1c06; border:none; border-radius:50px; padding:9px 18px; cursor:pointer; font-size:14.5px;
+  box-shadow:0 3px 6px rgba(0,0,0,0.45), inset 0 0 0 1px rgba(0,0,0,0.15);
+}
+.btn-seal:hover{ filter:brightness(1.05); }
+.btn-seal:active{ transform:translateY(1px); }
+
+.hidden{ display:none !important; }
+
+.game-grid{ display:grid; grid-template-columns:1fr 240px; gap:18px; }
+@media (max-width:720px){ .game-grid{ grid-template-columns:1fr; } }
+
+.scene-frame{
+  position:relative; border:10px solid transparent;
+  border-image: repeating-linear-gradient(45deg, var(--brass) 0 4px, var(--brass-light) 4px 8px) 10;
+  background:var(--parchment-3); border-radius:2px; overflow:hidden;
+  box-shadow:0 0 0 3px var(--ink) inset, var(--shadow);
+}
+.scene-frame::before{
+  content:""; position:absolute; inset:0;
+  background:radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(40,25,10,0.35) 100%);
+  pointer-events:none; animation:flicker 6s ease-in-out infinite;
+}
+@keyframes flicker{ 0%,100%{ opacity:0.9; } 50%{ opacity:1; } }
+.scene-frame svg{ display:block; width:100%; height:auto; color:var(--ink); }
+.scene-frame .art-wrap{ aspect-ratio:16/10; display:flex; align-items:center; justify-content:center; }
+
+.narration{ font-size:18px; line-height:1.65; color:var(--parchment-3); padding:18px 4px 4px; }
+.narration p{ margin:0 0 12px; }
+.narration p.gm-p:first-letter{ font-family:'Cinzel Decorative', serif; font-size:30px; color:var(--brass-light); padding-right:4px; }
+.log-entry-player{ font-style:italic; color:var(--brass-light); border-left:2px solid var(--brass); padding-left:10px; margin:14px 0 10px; font-size:15px; }
+.log-entry-roll{ font-style:italic; color:var(--parchment-2); border-left:2px dashed var(--brass); padding-left:10px; margin:10px 0; font-size:14px; }
+
+.options-row{ display:flex; flex-wrap:wrap; gap:10px; margin:16px 0 4px; }
+.action-bar{ display:flex; gap:10px; margin-top:14px; }
+.action-bar input{ flex:1; }
+
+.roll-box{
+  margin:16px 0; padding:14px 16px; border:1px dashed var(--brass); border-radius:4px;
+  background:rgba(169,131,44,0.08); display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;
+}
+.roll-box .reason{ font-style:italic; color:var(--parchment-2); font-size:15px; }
+.die{
+  display:inline-flex; align-items:center; justify-content:center; width:46px; height:46px; border-radius:6px;
+  background:var(--ink); color:var(--brass-light); font-family:'Cinzel', serif; font-weight:600; font-size:16px; border:1px solid var(--brass);
+}
+
+.sheet{ font-size:14.5px; }
+.sheet h3{ color:var(--brass-light); font-size:16px; margin-bottom:10px; }
+.sheet .name{ font-family:'Cinzel', serif; font-size:17px; color:var(--parchment-3); }
+.sheet .klass{ color:var(--parchment-2); font-style:italic; margin-bottom:12px; }
+.hp-label{ display:flex; justify-content:space-between; font-size:13px; color:var(--parchment-2); margin-bottom:4px; }
+.hp-bar{ height:14px; background:var(--ink); border:1px solid var(--brass); border-radius:8px; overflow:hidden; margin-bottom:14px; }
+.hp-fill{ height:100%; background:linear-gradient(90deg,var(--blood),var(--blood-bright)); transition:width .4s ease; }
+.inv-list{ list-style:none; padding:0; margin:0; }
+.inv-list li{ padding:4px 0; border-bottom:1px solid rgba(169,131,44,0.25); font-size:13.5px; color:var(--parchment-2); display:flex; justify-content:space-between; }
+.inv-list li:last-child{ border-bottom:none; }
+
+.loading{ text-align:center; padding:16px; font-style:italic; color:var(--brass-light); font-size:15px; }
+.loading::after{ content:"…"; }
+
+.topbar{ display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:8px; }
+.mini-hp{ font-size:13px; color:var(--parchment-2); }
+
+.error-box{ color:#e8a0a0; font-size:14px; margin-top:10px; }
+.hint{ font-size:12.5px; color:var(--parchment-2); opacity:0.75; font-style:italic; margin-top:10px; }
+
+.code-display{
+  font-family:'Cinzel Decorative', serif; font-size:34px; letter-spacing:6px; text-align:center;
+  color:var(--brass-light); background:var(--ink); border:2px solid var(--brass); border-radius:6px; padding:16px; margin:10px 0 16px;
+}
+
+.player-card{
+  border:1px solid rgba(169,131,44,0.35); border-radius:4px; padding:12px 14px; margin-bottom:10px;
+  background:rgba(0,0,0,0.15);
+}
+.player-card summary{ cursor:pointer; font-family:'Cinzel', serif; color:var(--brass-light); font-size:15px; }
+.player-card .pc-meta{ color:var(--parchment-2); font-size:13px; font-style:italic; margin-left:6px; }
+.player-card .pc-body{ margin-top:8px; font-size:14px; line-height:1.5; }
+.player-card .pc-body div{ margin-bottom:6px; }
+.player-card .pc-label{ color:var(--brass-light); font-size:12.5px; text-transform:uppercase; letter-spacing:0.5px; margin-right:6px; }
+
+.stage-list{ list-style:none; padding:0; margin:0 0 6px; counter-reset:stage; }
+.stage-list li{
+  position:relative; padding:8px 0 8px 30px; font-size:14px; color:var(--parchment-2);
+  border-bottom:1px solid rgba(169,131,44,0.2);
+}
+.stage-list li:last-child{ border-bottom:none; }
+.stage-list li::before{
+  counter-increment:stage; content:counter(stage);
+  position:absolute; left:0; top:8px; width:20px; height:20px; border-radius:50%;
+  border:1px solid var(--brass); color:var(--brass-light); font-size:11px;
+  display:flex; align-items:center; justify-content:center; font-family:'Cinzel', serif;
+}
+.stage-list li.done{ opacity:0.55; text-decoration:line-through; }
+.stage-list li.done::before{ content:"✓"; background:var(--brass); color:var(--ink); }
+.stage-list li.current{ color:var(--parchment-3); font-weight:500; }
+.stage-list li.current::before{ background:var(--brass-light); color:var(--ink); border-color:var(--brass-light); }
+.stage-list .stage-desc{ display:block; font-size:12.5px; font-style:italic; opacity:0.8; margin-top:2px; }
+
+.roster-list{ list-style:none; padding:0; margin:0; }
+.roster-list li{ font-size:13.5px; color:var(--parchment-2); padding:4px 0; border-bottom:1px solid rgba(169,131,44,0.2); }
+.roster-list li:last-child{ border-bottom:none; }
+.roster-list .r-name{ color:var(--parchment-3); font-weight:500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="masthead">
+    <h1>Хроники подземелья</h1>
+    <div class="rule"></div>
+    <div class="sub">Ведущий сплетает сцену — тьма отвечает на каждый шаг партии</div>
+  </div>
+
+  <div id="landing" class="panel">
+    <p style="margin-top:0;">Собери отряд по коду комнаты — каждый игрок придумывает своего героя на отдельном устройстве.</p>
+    <div class="row2">
+      <button class="btn" id="role-gm-btn">Я — Мастер, создаю партию</button>
+      <button class="btn btn-ghost" id="role-player-btn">У меня есть код — присоединяюсь</button>
+    </div>
+    <div class="hint">Данные комнаты (включая анкеты игроков) хранятся в базе на сервере и доступны любому, кто знает код комнаты — не делись кодом с посторонними.</div>
+    <div class="hint">Работает только когда сайт задеплоен со своим бэкендом (см. README) — API-запросы идут на /api/chat и /api/room.</div>
+  </div>
+
+  <div id="gm-create" class="panel hidden">
+    <label for="scenario">Полный сценарий кампании (сцены, повороты сюжета, ключевые события)</label>
+    <textarea id="scenario" rows="10" placeholder="Опиши сценарий целиком: завязку, ключевые сцены, повороты сюжета, развязку. Чем подробнее — тем точнее ИИ будет держаться сюжета.">Отряд ищет вход в затопленную гробницу под старым мостом, о которой ходят слухи в приграничной деревне.
+
+1. Отряд прибывает в деревню и узнаёт от местных о слухах и пропавших жителях.
+2. У старого моста отряд находит скрытый лаз, ведущий вниз, но охраняемый ловушками.
+3. В первом зале гробницы отряд встречает призрака хранителя, который проверяет их на прочность.
+4. Отряд находит дневник, раскрывающий, что гробница принадлежит древнему магу, чьё проклятие пробуждается.
+5. В глубине гробницы отряд сталкивается с самим магом (нежитью) и должен либо победить его, либо разрушить источник проклятия.
+6. Развязка: отряд выбирается из гробницы с сокровищами и знанием, изменившим деревню навсегда.</textarea>
+    <label for="gm-name">Твоё имя (Мастер)</label>
+    <input type="text" id="gm-name" value="Мастер">
+    <div style="margin-top:18px; text-align:right;">
+      <button class="btn" id="create-room-btn">Создать комнату</button>
+    </div>
+    <div id="create-error" class="error-box hidden"></div>
+  </div>
+
+  <div id="gm-lobby" class="panel hidden">
+    <h3 style="text-align:center; color:var(--parchment-2); font-size:15px; font-weight:400; font-style:italic;">Код комнаты для игроков</h3>
+    <div class="code-display" id="room-code-display"></div>
+    <div style="text-align:center; margin-bottom:18px;">
+      <button class="btn-ghost btn" id="copy-code-btn" style="font-size:12.5px; padding:7px 14px;">Скопировать код</button>
+    </div>
+    <h3 style="margin-bottom:10px;">Этапы сюжета (распознаны ИИ из сценария)</h3>
+    <ol class="stage-list" id="lobby-stages"></ol>
+    <h3 style="margin:18px 0 10px;">Собравшиеся герои</h3>
+    <div id="lobby-players"></div>
+    <div id="lobby-empty" class="hint">Пока никто не присоединился.</div>
+    <div style="margin-top:18px; text-align:right;">
+      <button class="btn" id="start-game-btn" disabled>Начать игру</button>
+    </div>
+  </div>
+
+  <div id="player-join" class="panel hidden">
+    <label for="join-code">Код комнаты</label>
+    <input type="text" id="join-code" placeholder="Например: K7F2Q" style="text-transform:uppercase;">
+    <div style="margin-top:18px; text-align:right;">
+      <button class="btn" id="join-room-btn">Войти</button>
+    </div>
+    <div id="join-error" class="error-box hidden"></div>
+  </div>
+
+  <div id="player-form" class="panel hidden">
+    <p style="margin-top:0; font-style:italic; color:var(--parchment-2);">Придумай своего героя — это увидит только Мастер и ты сам.</p>
+    <div class="row2">
+      <div>
+        <label for="p-name">Имя персонажа</label>
+        <input type="text" id="p-name" placeholder="Рейнард">
+      </div>
+      <div>
+        <label for="p-class">Класс</label>
+        <select id="p-class">
+          <option>Воин</option><option>Плут</option><option>Маг</option><option>Жрец</option><option>Следопыт</option>
+        </select>
+      </div>
+    </div>
+    <label for="p-backstory">Предыстория</label>
+    <textarea id="p-backstory" rows="3" placeholder="Откуда герой родом, что с ним случилось раньше..."></textarea>
+    <label for="p-trait">Черта характера</label>
+    <input type="text" id="p-trait" placeholder="Например: не может пройти мимо чужой беды">
+    <label for="p-goal">Цель / мотивация</label>
+    <input type="text" id="p-goal" placeholder="Например: ищет пропавшего брата">
+    <label for="p-secret">Тайна (узнает только Мастер, партия — по ходу истории)</label>
+    <textarea id="p-secret" rows="2" placeholder="Например: втайне служит культу, о котором никто не знает"></textarea>
+    <div style="margin-top:18px; text-align:right;">
+      <button class="btn" id="submit-form-btn">Отправить анкету</button>
+    </div>
+    <div id="form-error" class="error-box hidden"></div>
+  </div>
+
+  <div id="player-wait" class="panel hidden">
+    <h3 style="margin-bottom:10px;">Твой герой</h3>
+    <div id="wait-recap"></div>
+    <p class="loading" style="margin-top:16px;">Ожидаем, пока Мастер начнёт игру</p>
+  </div>
+
+  <div id="game" class="hidden">
+    <div class="topbar">
+      <div id="gm-party-toggle-wrap" style="display:flex; gap:8px;"></div>
+      <div class="mini-hp" id="mini-hp"></div>
+    </div>
+
+    <div id="gm-party-panel" class="panel hidden"></div>
+
+    <details class="panel" id="stage-panel" open>
+      <summary style="cursor:pointer; font-family:'Cinzel', serif; color:var(--brass-light); font-size:15px;">Этапы сюжета</summary>
+      <ol class="stage-list" id="game-stages" style="margin-top:10px;"></ol>
+    </details>
+
+    <div class="game-grid">
+      <div>
+        <div class="panel" style="padding:0;">
+          <div class="scene-frame"><div class="art-wrap" id="art-wrap"></div></div>
+          <div class="narration" id="narration"></div>
+          <div id="roll-area"></div>
+          <div class="options-row" id="options-row"></div>
+          <div class="action-bar">
+            <input type="text" id="action-input" placeholder="Что ты делаешь?">
+            <button class="btn" id="send-btn">Действовать</button>
+          </div>
+          <div id="game-error" class="error-box hidden"></div>
+          <div id="loading" class="loading hidden">Мастер обдумывает судьбу</div>
+        </div>
+      </div>
+
+      <div>
+        <div class="panel sheet">
+          <h3>Твой герой</h3>
+          <div class="name" id="sheet-name"></div>
+          <div class="klass" id="sheet-class"></div>
+          <div class="hp-label"><span>Здоровье</span><span id="hp-text"></span></div>
+          <div class="hp-bar"><div class="hp-fill" id="hp-fill"></div></div>
+          <h3 style="margin-top:16px;">Характеристики</h3>
+          <ul class="inv-list" id="mod-list"></ul>
+          <h3 style="margin-top:16px;">Снаряжение</h3>
+          <ul class="inv-list" id="inv-list"></ul>
+        </div>
+        <div class="panel sheet">
+          <h3>Отряд</h3>
+          <ul class="roster-list" id="roster-list"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const SKILLS = ["Сила","Ловкость","Телосложение","Интеллект","Мудрость","Обаяние"];
+const CLASS_MODIFIERS = {
+  "Воин":      { "Сила":3, "Телосложение":2, "Ловкость":1, "Интеллект":0, "Мудрость":0, "Обаяние":1 },
+  "Плут":      { "Сила":0, "Телосложение":1, "Ловкость":3, "Интеллект":1, "Мудрость":1, "Обаяние":2 },
+  "Маг":       { "Сила":-1,"Телосложение":0, "Ловкость":1, "Интеллект":3, "Мудрость":2, "Обаяние":1 },
+  "Жрец":      { "Сила":1, "Телосложение":1, "Ловкость":0, "Интеллект":1, "Мудрость":3, "Обаяние":2 },
+  "Следопыт":  { "Сила":1, "Телосложение":1, "Ловкость":2, "Интеллект":1, "Мудрость":2, "Обаяние":0 }
+};
+function getModifier(klass, skill){
+  const table = CLASS_MODIFIERS[klass] || {};
+  return (skill && table[skill] !== undefined) ? table[skill] : 0;
+}
+
+function el(id){ return document.getElementById(id); }
+function show(id){ el(id).classList.remove('hidden'); }
+function hide(id){ el(id).classList.add('hidden'); }
+
+function makeRoomCode(){
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for(let i=0;i<5;i++) s += chars[Math.floor(Math.random()*chars.length)];
+  return s;
+}
+function makeId(){
+  return 'p_' + Math.random().toString(36).slice(2,10);
+}
+
+async function loadRoom(code){
+  try{
+    const res = await fetch('/api/room?code=' + encodeURIComponent(code));
+    if(!res.ok) return null;
+    const data = await res.json();
+    return data.room || null;
+  }catch(e){ return null; }
+}
+async function saveRoom(code, obj){
+  try{
+    const res = await fetch('/api/room?code=' + encodeURIComponent(code), {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(obj)
+    });
+    return res.ok;
+  }catch(e){ return false; }
+}
+
+let myRole = null;
+let roomCode = null;
+let myPlayerId = null;
+let pollTimer = null;
+let engineTimer = null;
+
+function extractJSON(text){
+  let t = text.trim();
+  t = t.replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+  try{ return JSON.parse(t); }catch(e){}
+  const first = t.indexOf('{'); const last = t.lastIndexOf('}');
+  if(first !== -1 && last !== -1 && last > first){
+    try{ return JSON.parse(t.slice(first, last+1)); }catch(e){}
+  }
+  return null;
+}
+
+const STAGE_EXTRACT_SYSTEM = `Ты помощник Мастера DnD. Тебе дают полный текст сценария кампании. Разбей его на 4-8 последовательных сюжетных этапов (ключевых сцен/поворотов), которые должны произойти по ходу игры, в логическом порядке. Отвечай ТОЛЬКО валидным JSON-массивом без markdown и пояснений: [{"title":"короткое название этапа (3-6 слов)","description":"одно предложение сути этапа"}, ...]`;
+
+function buildSystemPrompt(room){
+  const stages = room.stages || [];
+  const stageLines = stages.map((s,i)=>{
+    const mark = s.done ? '[пройден]' : (i === room.currentStageIndex ? '[ТЕКУЩИЙ]' : '[впереди]');
+    return `${i+1}. ${mark} ${s.title} — ${s.description}`;
+  }).join('\n');
+
+  return `Ты — опытный Мастер Подземелий (в духе DnD 5e, упрощённые правила) для группы игроков. Полный сценарий кампании:
+${room.scenario}
+
+Заранее выделенные этапы сюжета (ориентир, не зачитывай их игрокам буквально):
+${stageLines}
+
+Веди общую историю, реагируя на действия игроков живо и правдоподобно, но старайся естественно подводить партию к текущему этапу [ТЕКУЩИЙ], если игроки не увели сюжет слишком далеко в сторону. Когда события хода явно достигают сути текущего этапа — отметь это через поле stage_complete: true, и дальше веди партию к следующему этапу. Если Мастер лично попросит подтолкнуть сюжет к этапу (сообщение вида "[Мастер направляет ход событий: ...]") — обязательно продвинь историю к этому этапу правдоподобным образом в этом же ходу.
+
+В начале тебе дадут анкеты всех героев партии, включая их тайны — используй тайны для сюжетных крючков, но не раскрывай их напрямую другим игрокам без причины, только намёками или через события. Каждое сообщение игрока помечено его именем персонажа и классом — учитывай, кто именно действует. Проси бросок к20, когда исход неочевиден, указывая причину, характеристику (skill: Сила/Ловкость/Телосложение/Интеллект/Мудрость/Обаяние) и сложность (DC 10-18). Изменяй HP (hp_change) и добавляй находки (inventory_add) когда это логично — они относятся к тому герою, который действовал в этом ходу, если не указано иное. Когда получаешь сообщение с результатом броска вида "[Бросок: ... — УСПЕХ/ПРОВАЛ]" — строго следуй этому исходу.
+
+ВСЕГДА отвечай ТОЛЬКО валидным JSON без markdown-разметки, без \`\`\`, без пояснений вне JSON:
+{
+  "narration": "художественное описание на русском, 2-5 предложений",
   "scene_svg": "ПРОСТОЙ узнаваемый SVG-рисунок сцены в стиле гравюры: viewBox='0 0 400 250'. Рисуй буквально то, что описано в narration, используя эти готовые рецепты форм (комбинируй нужные): ДОМ/ХИЖИНА — прямоугольник (стены) + треугольник сверху (крыша), можно с маленьким прямоугольником-дверью снизу; ДЕРЕВО — вертикальная линия (ствол) + круг или пара кругов сверху (крона); ГОРЫ/ХОЛМЫ на фоне — несколько треугольников разной высоты вдоль верхней трети; ВОДА/РЕКА — 2-3 горизонтальные волнистые линии (path с плавными изгибами); ПЕРСОНАЖ/СУЩЕСТВО — круг (голова) на прямоугольнике или треугольнике (тело), простые линии-конечности; МОСТ — горизонтальный прямоугольник на 2-3 вертикальных опорах; ДВЕРЬ/ВХОД В ПОДЗЕМЕЛЬЕ — арка (полукруг path) с тёмным проёмом внутри; ФАКЕЛ/ОГОНЬ — вертикальная линия с волнистым овалом-пламенем сверху; НАДГРОБИЕ/КАМЕНЬ — скруглённый прямоугольник или полукруг. Собери сцену из 6-14 таких простых фигур на переднем/среднем/заднем плане (не больше — важна узнаваемость, а не количество деталей), можно добавить немного коротких штрихов-теней. Только path/line/circle/ellipse/polyline/rect со stroke='currentColor' fill='none' stroke-width 1.5-3, без градиентов/текста/заливок",
   "hp_change": 0,
   "roll_request": null,
