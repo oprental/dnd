@@ -113,7 +113,24 @@ textarea:focus, input[type=text]:focus, select:focus{ outline:2px solid var(--br
 .die{
   display:inline-flex; align-items:center; justify-content:center; width:46px; height:46px; border-radius:6px;
   background:var(--ink); color:var(--brass-light); font-family:'Cinzel', serif; font-weight:600; font-size:16px; border:1px solid var(--brass);
+  transition: background .25s ease, color .25s ease, border-color .25s ease;
 }
+@keyframes dieTumble{
+  0%   { transform: rotate(0deg) scale(1); }
+  25%  { transform: rotate(-18deg) scale(1.08); }
+  50%  { transform: rotate(12deg) scale(0.94); }
+  75%  { transform: rotate(-8deg) scale(1.05); }
+  100% { transform: rotate(0deg) scale(1); }
+}
+.die-rolling{ animation: dieTumble 0.22s linear infinite; }
+@keyframes dieLand{
+  0%   { transform: scale(1.35); }
+  60%  { transform: scale(0.92); }
+  100% { transform: scale(1); }
+}
+.die-landed{ animation: dieLand 0.35s ease-out; }
+.die-good{ background:linear-gradient(180deg,var(--brass-light),var(--brass)); color:var(--ink); border-color:var(--brass-light); }
+.die-bad{ background:var(--blood); color:#f3e6d8; border-color:var(--blood-bright); }
 
 .sheet{ font-size:14.5px; }
 .sheet h3{ color:var(--brass-light); font-size:16px; margin-bottom:10px; }
@@ -372,6 +389,7 @@ let myRole = null;
 let roomCode = null;
 let myPlayerId = null;
 let pollTimer = null;
+let rollAnimating = false;
 let engineTimer = null;
 
 function extractJSON(text){
@@ -776,13 +794,16 @@ async function refreshGameFromRoom(initial){
   const lastNarration = [...log].reverse().find(e=>e.kind==='narration');
   if(lastNarration){ renderScene(lastNarration.prompt, lastNarration.seed); }
 
-  const optionsRow = el('options-row'); optionsRow.innerHTML = '';
-  const rollArea = el('roll-area'); rollArea.innerHTML = '';
+  const optionsRow = el('options-row');
+  const rollArea = el('roll-area');
+  if(!rollAnimating){ optionsRow.innerHTML = ''; rollArea.innerHTML = ''; }
 
   const busy = !!room.processing;
   setLoading(busy);
 
-  if(room.pendingRoll){
+  if(rollAnimating){
+    // a local roll animation owns the roll box right now — leave it alone
+  } else if(room.pendingRoll){
     const pr = room.pendingRoll;
     const isMine = myRole === 'player' && pr.forPlayerId === myPlayerId;
     const forName = pr.forPlayerId && room.players[pr.forPlayerId] ? room.players[pr.forPlayerId].name : 'герой';
@@ -794,7 +815,7 @@ async function refreshGameFromRoom(initial){
     if(isMine){
       const btn = document.createElement('button');
       btn.className = 'btn-seal'; btn.textContent = 'Бросить к20';
-      btn.onclick = ()=> doRoll(pr);
+      btn.onclick = ()=> animateRoll(pr, box, btn);
       box.appendChild(btn);
     }
     rollArea.appendChild(box);
@@ -882,6 +903,7 @@ async function nudgeStory(){
 }
 
 async function clearStuckRoll(){
+  rollAnimating = false;
   const room = await loadRoom(roomCode);
   if(!room) return;
   room.pendingRoll = null;
@@ -906,18 +928,62 @@ async function sendAction(text){
   refreshGameFromRoom(false);
 }
 
-async function doRoll(pr){
+function animateRoll(pr, box, triggerBtn){
+  rollAnimating = true;
+  triggerBtn.disabled = true;
+  triggerBtn.textContent = 'Бросаем…';
+
+  const die = document.createElement('span');
+  die.className = 'die die-rolling';
+  die.textContent = '?';
+  box.appendChild(die);
+
+  let ticks = 0;
+  const maxTicks = 12;
+  const spin = setInterval(()=>{
+    die.textContent = String(Math.floor(Math.random()*20) + 1);
+    ticks++;
+    if(ticks >= maxTicks){
+      clearInterval(spin);
+      die.classList.remove('die-rolling');
+      die.classList.add('die-landed');
+      doRoll(pr, die, box, triggerBtn);
+    }
+  }, 80);
+}
+
+async function doRoll(pr, die, box, triggerBtn){
   const room = await loadRoom(roomCode);
-  if(!room) return;
+  if(!room){ rollAnimating = false; return; }
   const me = room.players[myPlayerId];
   const roll = Math.floor(Math.random()*20) + 1;
   const mod = getModifier(me.klass, pr.skill);
   const total = roll + mod;
   const success = total >= pr.dc;
+
+  if(die){
+    die.textContent = String(roll);
+    die.classList.add(success ? 'die-good' : 'die-bad');
+  }
+  if(triggerBtn){ triggerBtn.textContent = success ? 'Успех!' : 'Провал'; }
+  if(box){
+    const summary = document.createElement('div');
+    summary.style.width = '100%';
+    summary.style.fontSize = '13px';
+    summary.style.color = 'var(--parchment-2)';
+    summary.style.marginTop = '6px';
+    summary.textContent = `${roll}${mod!==0?(mod>0?'+':'')+mod:''} = ${total} против ${pr.dc}`;
+    box.appendChild(summary);
+  }
+
   room.log.push({ kind:'roll', player: me.name, reason: pr.reason, skill: pr.skill, dc: pr.dc, roll, mod, total, success, actorId: myPlayerId });
   room.pendingRoll = null;
   await saveRoom(roomCode, room);
-  refreshGameFromRoom(false);
+
+  setTimeout(()=>{
+    rollAnimating = false;
+    refreshGameFromRoom(false);
+  }, 900);
 }
 
 el('send-btn').addEventListener('click', ()=> sendAction(el('action-input').value));
